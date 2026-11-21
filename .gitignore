@@ -1,0 +1,8 @@
+# Build output
+emulator
+*.o
+
+# ROM images and books are copyrighted: never commit them
+*.rom
+*.bin
+*.pdf

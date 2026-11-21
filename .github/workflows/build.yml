@@ -1,0 +1,12 @@
+name: build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libncurses-dev
+      - run: make CFLAGS="-O2 -Wall -Wextra -Werror"
+      - run: ./tests/smoke.sh   # skips: no ROM is (or may be) included in the repo
