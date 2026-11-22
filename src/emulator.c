@@ -1267,6 +1267,14 @@ if (!quiet)
 				uint8_t op2 = ram[PC++];
 				switch (op2)
 				{
+					case 0x3F: // SWI2: stack everything, vector $FFF4 (I and F unchanged)
+						CC |= CC_E;
+						push_s16(PC); push_s16(U); push_s16(Y); push_s16(X);
+						push_s8(DP); push_s8(B); push_s8(A); push_s8(CC);
+						PC = mem_read16(0xFFF4);
+						if (!quiet) printf("\tSWI2 [103F]");
+						executed = true;
+						break;
 					// Long branches ($10 $21 to $10 $2F)
 					case 0x21: do_lbranch(false, "LBRN", quiet); executed = true; break;
 					case 0x22: do_lbranch(!(CC & (CC_C | CC_Z)), "LBHI", quiet); executed = true; break;
@@ -1532,7 +1540,11 @@ if (!quiet)
 				uint8_t op2 = ram[PC++];
 				switch (op2)
 				{
-					case 0x3F: // SWI3
+					case 0x3F: // SWI3: stack everything, vector $FFF2 (I and F unchanged)
+						CC |= CC_E;
+						push_s16(PC); push_s16(U); push_s16(Y); push_s16(X);
+						push_s8(DP); push_s8(B); push_s8(A); push_s8(CC);
+						PC = mem_read16(0xFFF2);
 						if (!quiet) printf("\tSWI3 [113F]");
 						executed = true;
 						break;
@@ -1838,7 +1850,7 @@ if (!quiet)
 				push_s8(A);
 				push_s8(CC);
 				CC |= (CC_I | CC_F);
-				PC = mem_read16(0xFFF6);
+				PC = mem_read16(0xFFFA);	// SWI vector (was $FFF6, the FIRQ vector)
 				if (!quiet) printf("\tSWI [3F]\t-> $%04X", PC);
 				executed = true;
 				break;
