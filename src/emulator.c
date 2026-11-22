@@ -1548,21 +1548,76 @@ if (!quiet)
 						if (!quiet) printf("\tSWI3 [113F]");
 						executed = true;
 						break;
-					case 0x8C: // CMPU immediate
+					// Page 3 is SWI3 + CMPU/CMPS.  (The first version had CMPU at
+					// $8C and CMPS at $8E, and no $83: the ROM's CMPU #$03D9
+					// ran its operand as COM <$D9.  Found with an XRoar trace.)
+					case 0x83: // CMPU immediate
 					{
 						uint16_t val16 = ((uint16_t)ram[PC] << 8) | ram[PC+1];
 						PC += 2;
 						do_sub16(U, val16);
-						if (!quiet) printf("\tCMPU [118C]\t#$%04X", val16);
+						if (!quiet) printf("\tCMPU [1183]\t#$%04X", val16);
 						executed = true;
 						break;
 					}
-					case 0x8E: // CMPS immediate
+					case 0x8C: // CMPS immediate
 					{
 						uint16_t val16 = ((uint16_t)ram[PC] << 8) | ram[PC+1];
 						PC += 2;
 						do_sub16(S, val16);
-						if (!quiet) printf("\tCMPS [118E]\t#$%04X", val16);
+						if (!quiet) printf("\tCMPS [118C]\t#$%04X", val16);
+						executed = true;
+						break;
+					}
+					case 0x93: // CMPU direct
+					{
+						uint16_t addr = ((uint16_t)DP << 8) | ram[PC++];
+						do_sub16(U, mem_read16(addr));
+						if (!quiet) printf("\tCMPU [1193]\t<$%02X", addr & 0xFF);
+						executed = true;
+						break;
+					}
+					case 0x9C: // CMPS direct
+					{
+						uint16_t addr = ((uint16_t)DP << 8) | ram[PC++];
+						do_sub16(S, mem_read16(addr));
+						if (!quiet) printf("\tCMPS [119C]\t<$%02X", addr & 0xFF);
+						executed = true;
+						break;
+					}
+					case 0xA3: // CMPU indexed
+					{
+						char disasm[32];
+						uint16_t ea = decode_indexed(disasm, sizeof(disasm));
+						do_sub16(U, mem_read16(ea));
+						if (!quiet) printf("\tCMPU [11A3]\t%s", disasm);
+						executed = true;
+						break;
+					}
+					case 0xAC: // CMPS indexed
+					{
+						char disasm[32];
+						uint16_t ea = decode_indexed(disasm, sizeof(disasm));
+						do_sub16(S, mem_read16(ea));
+						if (!quiet) printf("\tCMPS [11AC]\t%s", disasm);
+						executed = true;
+						break;
+					}
+					case 0xB3: // CMPU extended
+					{
+						uint16_t addr = ((uint16_t)ram[PC] << 8) | ram[PC+1];
+						PC += 2;
+						do_sub16(U, mem_read16(addr));
+						if (!quiet) printf("\tCMPU [11B3]\t$%04X", addr);
+						executed = true;
+						break;
+					}
+					case 0xBC: // CMPS extended
+					{
+						uint16_t addr = ((uint16_t)ram[PC] << 8) | ram[PC+1];
+						PC += 2;
+						do_sub16(S, mem_read16(addr));
+						if (!quiet) printf("\tCMPS [11BC]\t$%04X", addr);
 						executed = true;
 						break;
 					}
