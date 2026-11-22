@@ -1,7 +1,13 @@
 /*
- * emulator.c - Motorola 6809 CPU emulator with Dragon 32 support
+ * dragon_cpu.c - Motorola 6809 CPU + Dragon 32 memory map and keyboard
  *
  * Copyright (C) 2021-2026 Dylan Jones
+ *
+ * This is src/emulator.c from 6809Emulator (commit 1a96432) with the
+ * ncurses screen, ROM file loading and main() taken out; the CPU,
+ * memory map and keyboard matrix code is unchanged.  The platform API
+ * (dragon.h) is at the end of the file.  Keep CPU fixes in step with
+ * the 6809Emulator repo.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -12,26 +18,15 @@
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
- * MA 02110-1301, USA.
- *
- * Tip: "mame dragon32 -debug" steps through the same ROM, handy for
- * comparing behaviour instruction by instruction.
  */
-
+#include "dragon.h"
+#include "tape.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <ctype.h>
-#include <time.h>
-#include <unistd.h>
-#include <signal.h>
-#include <ncurses.h>
 
 // This will contain the ROM
 static unsigned char rom[16384];
@@ -77,20 +72,12 @@ static inline void set_D(uint16_t val)
 
 // Dragon 32 Keyboard Matrix & Input Emulation
 
-static bool ncurses_active = false;
+static bool trace_on;			// print each instruction (dragon_step)
 
-static void cleanup_and_exit(int sig)
-{
-	(void)sig;
-	if (ncurses_active)
-	{
-		endwin();
-		ncurses_active = false;
-	}
-	exit(0);
-}
+// CPU wait states: SYNC waits for any interrupt line, CWAI has already
+// stacked the registers and waits for an unmasked interrupt
+static bool cpu_sync, cpu_cwai;
 
-static uint8_t pia0_pb = 0xFF; // Columns output ($FF02)
 static uint8_t key_matrix[8] = { 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F }; // Rows PA0..PA6 for each column (active low)
 
 typedef struct {
@@ -283,7 +270,7 @@ static void kbd_update_cycles(int cycles)
 		if (kbd_hold_cycles <= 0)
 		{
 			kbd_clear_matrix();
-			kbd_release_cycles = 15000;
+			kbd_release_cycles = 60000;	// ~68 ms (was 15000 instructions)
 		}
 	}
 	else if (kbd_release_cycles > 0)
@@ -296,42 +283,190 @@ static void kbd_update_cycles(int cycles)
 		kbd_q_head = (kbd_q_head + 1) % KBD_QUEUE_SIZE;
 		kbd_clear_matrix();
 		kbd_set_key(ev.row, ev.col, ev.shift);
-		kbd_hold_cycles = 25000;
+		kbd_hold_cycles = 100000;	// ~113 ms (was 25000 instructions)
 	}
+}
+
+// ---- MC6821 PIAs ($FF00-$FF1F = PIA0, $FF20-$FF3F = PIA1, mirrored every 4) ----
+// Behaviour follows the MC6821 datasheet as modelled in XRoar: a data
+// address reads the data direction register when control bit 2 is 0;
+// reading the data register clears the interrupt flags; Cx1 edges set
+// control bit 7 and pull IRQ (PIA0) or FIRQ (PIA1) when bit 0 enables it.
+//
+// PIA0 A: keyboard rows (PA0-6) + joystick comparator (PA7)   CA1: HS  CA2: sound mux SEL1
+// PIA0 B: keyboard columns (out)                              CB1: FS  CB2: sound mux SEL2
+// PIA1 A: PA2-7 6-bit DAC, PA1 printer strobe, PA0 cassette   CA2: cassette motor
+// PIA1 B: PB3-7 VDG mode, PB1 single-bit sound, PB0 printer busy  CB2: sound enable
+
+typedef struct
+{
+	uint8_t ora, ddra, cra;		// port A output, direction, control
+	uint8_t orb, ddrb, crb;
+	bool ca1, cb1;			// current level on the Cx1 inputs
+} Pia;
+
+static Pia pia0, pia1;
+
+static void audio_update_level(void);
+
+static void pia_reset(Pia *p)
+{
+	memset(p, 0, sizeof(*p));
+	p->ca1 = p->cb1 = true;
+}
+
+// Cx1 input changed: the active edge (control bit 1: 0 = falling, 1 = rising)
+// sets the flag in control bit 7
+static void pia_set_cx1(uint8_t *cr, bool *line, bool level)
+{
+	if (level == *line)
+	{
+		return;
+	}
+	*line = level;
+	if (((*cr & 0x02) != 0) == level)
+	{
+		*cr |= 0x80;
+	}
+}
+
+static inline bool pia_irq(const Pia *p)
+{
+	return ((p->cra & 0x81) == 0x81) || ((p->crb & 0x81) == 0x81);
+}
+
+// Cx2 as a manual output (control bits 5,4 = 1,1) gives bit 3; otherwise high
+static inline bool pia_cx2(uint8_t cr)
+{
+	return (cr & 0x30) == 0x30 ? (cr & 0x08) != 0 : true;
+}
+
+// Pin levels on an output port: outputs drive, inputs float high (port A)
+static inline uint8_t pia_out_a(const Pia *p)
+{
+	return (uint8_t)~(~p->ora & p->ddra);
+}
+
+static inline uint8_t pia_out_b(const Pia *p)
+{
+	return p->orb & p->ddrb;
+}
+
+static uint8_t keyboard_rows(void)
+{
+	uint8_t cols = pia_out_b(&pia0) | (uint8_t)~pia0.ddrb;	// undriven columns stay high
+	uint8_t rows = 0x7F;
+	for (int col = 0; col < 8; col++)
+	{
+		if ((cols & (1 << col)) == 0)
+		{
+			rows &= key_matrix[col];
+		}
+	}
+	return rows | 0x80;	// PA7: joystick comparator, no joystick
+}
+
+static uint8_t pia_read(uint16_t addr)
+{
+	Pia *p = (addr & 0x20) ? &pia1 : &pia0;
+	switch (addr & 3)
+	{
+	case 0:
+		if (!(p->cra & 0x04))
+		{
+			return p->ddra;
+		}
+		p->cra &= 0x3F;		// reading the data clears the flags
+		{
+			uint8_t in = (p == &pia0) ? keyboard_rows()
+				   : (uint8_t)(0xFE | (tape_input_level() ? 1 : 0));	// PIA1 PA0: cassette in
+			return pia_out_a(p) & in;
+		}
+	case 1:
+		return p->cra;
+	case 2:
+		if (!(p->crb & 0x04))
+		{
+			return p->ddrb;
+		}
+		p->crb &= 0x3F;
+		{
+			uint8_t in = (p == &pia1) ? 0x01 : 0x00;	// PIA1 PB0: printer !BUSY pulled up
+			return (pia_out_b(p) | (in & (uint8_t)~p->ddrb));
+		}
+	default:
+		return p->crb;
+	}
+}
+
+static void pia_write(uint16_t addr, uint8_t val)
+{
+	Pia *p = (addr & 0x20) ? &pia1 : &pia0;
+	switch (addr & 3)
+	{
+	case 0:
+		if (p->cra & 0x04) p->ora = val; else p->ddra = val;
+		break;
+	case 1:
+		p->cra = (uint8_t)((p->cra & 0xC0) | (val & 0x3F));
+		break;
+	case 2:
+		if (p->crb & 0x04) p->orb = val; else p->ddrb = val;
+		break;
+	default:
+		p->crb = (uint8_t)((p->crb & 0xC0) | (val & 0x3F));
+		break;
+	}
+	// The VDG reads PIA1 port B (mode bits); keep a copy where vdg.c looks
+	ram[0xFF22] = pia_out_b(&pia1);
+	// Cassette motor relay: PIA1 CA2 as an output, set high
+	tape_set_motor((pia1.cra & 0x38) == 0x38);
+	audio_update_level();
 }
 
 static inline uint8_t mem_read(uint16_t addr)
 {
-	if (addr == 0xFF00)
+	if ((addr & 0xFFC0) == 0xFF00)
 	{
-		uint8_t rows = 0x7F;
-		for (int col = 0; col < 8; col++)
-		{
-			if ((pia0_pb & (1 << col)) == 0)
-			{
-				rows &= key_matrix[col];
-			}
-		}
-		return rows | 0x80;
-	}
-	if (addr == 0xFF02)
-	{
-		return pia0_pb;
+		return pia_read(addr);
 	}
 	return ram[addr];
 }
 
 static inline uint16_t mem_read16(uint16_t addr)
 {
+	if (addr >= 0xFEFF && addr < 0xFF40)	// either byte in the PIAs
+	{
+		return ((uint16_t)mem_read(addr) << 8) | mem_read((uint16_t)(addr + 1));
+	}
 	return ((uint16_t)ram[addr] << 8) | ram[(uint16_t)(addr + 1)];
 }
 
+// ---- SAM (MC6883) ----
+// 16 control bits, each set by writing anywhere to an odd address and
+// cleared by an even one in $FFC0-$FFDF: V0-V2 (display mode), F0-F6
+// (display start, x 512 bytes), P1, R0-R1 (CPU rate), M0-M1 (memory size),
+// TY (map type).  The data written doesn't matter.
+static uint16_t sam_reg;
+
 static inline void mem_write(uint16_t addr, uint8_t val)
 {
-	if (addr == 0xFF02)
+	if ((addr & 0xFFC0) == 0xFF00)
 	{
-		pia0_pb = val;
-		ram[addr] = val;
+		pia_write(addr, val);
+		return;
+	}
+	if (addr >= 0xFFC0 && addr <= 0xFFDF)
+	{
+		uint16_t bit = (uint16_t)(1u << ((addr - 0xFFC0) >> 1));
+		if (addr & 1)
+		{
+			sam_reg |= bit;
+		}
+		else
+		{
+			sam_reg &= (uint16_t)~bit;
+		}
 		return;
 	}
 	// Dragon 32 ROM Protection:
@@ -800,7 +935,6 @@ static inline void do_exg(char *disasm, size_t maxlen)
 	if (disasm) snprintf(disasm, maxlen, "%s,%s", get_tfr_reg_name(r1), get_tfr_reg_name(r2));
 }
 
-static char *filename;
 
 typedef struct
 {
@@ -985,25 +1119,6 @@ static void importOpcodes(void)
 	}
 }
 
-static void loadRomFile(void)
-{
-	printf("Loading ROM file %s\n", filename);
-	FILE *ptr = fopen(filename, "rb");
-	if (!ptr)
-	{
-		perror("Failed to open ROM file");
-		exit(1);
-	}
-	size_t got = fread(rom, 1, sizeof(rom), ptr);
-	if (got != sizeof(rom))
-	{
-		fprintf(stderr, "ROM file %s is %zu bytes; a Dragon 32 ROM is %zu bytes\n",
-			filename, got, sizeof(rom));
-		fclose(ptr);
-		exit(1);
-	}
-	fclose(ptr);
-}
 
 static void loadRom(void)
 {
@@ -1016,124 +1131,6 @@ static void loadRom(void)
 	{
 		ram[c] = rom[c - 0xC000];
 	}
-}
-
-static void dump_screen(void)
-{
-	printf("\n--- DRAGON 32 TEXT SCREEN (0x0400 - 0x05FF) ---\n");
-	printf("+--------------------------------+\n");
-	for (int row = 0; row < 16; row++)
-	{
-		printf("|");
-		for (int col = 0; col < 32; col++)
-		{
-			uint8_t ch = ram[0x0400 + row * 32 + col];
-			// Motorola 6847 VDG character decoding:
-			// 0x40-0x5F: Normal Uppercase Letters (@, A-Z)
-			// 0x60-0x7F: Normal Digits, Punctuation & Space (ASCII 0x20-0x3F + 0x40)
-			// 0x00-0x1F: Inverted Uppercase Letters
-			// 0x20-0x3F: Inverted Digits, Punctuation & Space
-			char c;
-			if (ch >= 0x60 && ch <= 0x7F)
-			{
-				c = (char)(ch - 0x40);
-			}
-			else if (ch >= 0x40 && ch <= 0x5F)
-			{
-				c = (char)ch;
-			}
-			else if (ch <= 0x1F)
-			{
-				c = (char)(ch + 0x40);
-			}
-			else
-			{
-				c = (char)ch;
-			}
-			putchar(c);
-		}
-		printf("|\n");
-	}
-	printf("+--------------------------------+\n");
-}
-
-
-static void draw_ncurses_screen(void)
-{
-	int start_y = 1;
-	int start_x = 2;
-
-	// Draw border
-	attron(COLOR_PAIR(3));
-	mvprintw(start_y - 1, start_x - 1, "+--------------------------------+");
-	for (int r = 0; r < 16; r++)
-	{
-		mvaddch(start_y + r, start_x - 1, '|');
-		mvaddch(start_y + r, start_x + 32, '|');
-	}
-	mvprintw(start_y + 16, start_x - 1, "+--------------------------------+");
-	attroff(COLOR_PAIR(3));
-
-	// Draw 32x16 screen content
-	for (int r = 0; r < 16; r++)
-	{
-		for (int c = 0; c < 32; c++)
-		{
-			uint8_t ch = ram[0x0400 + r * 32 + c];
-			char ch_out;
-			bool inverted = false;
-
-			if (ch >= 0x60 && ch <= 0x7F)
-			{
-				ch_out = (char)(ch - 0x40);
-			}
-			else if (ch >= 0x40 && ch <= 0x5F)
-			{
-				ch_out = (char)ch;
-			}
-			else if (ch <= 0x1F)
-			{
-				ch_out = (char)(ch + 0x40);
-				inverted = true;
-			}
-			else
-			{
-				ch_out = (char)ch;
-				inverted = true;
-			}
-
-			if (inverted)
-			{
-				attron(COLOR_PAIR(2));
-				mvaddch(start_y + r, start_x + c, ch_out);
-				attroff(COLOR_PAIR(2));
-			}
-			else
-			{
-				attron(COLOR_PAIR(1));
-				mvaddch(start_y + r, start_x + c, ch_out);
-				attroff(COLOR_PAIR(1));
-			}
-		}
-	}
-
-	// Status bar
-	attron(COLOR_PAIR(3));
-	mvprintw(start_y + 17, start_x - 1, "PC:%04X  A:%02X B:%02X X:%04X Y:%04X S:%04X", PC, A, B, X, Y, S);
-	mvprintw(start_y + 18, start_x - 1, "CC:[%c%c%c%c%c%c%c%c]  DP:%02X",
-		(CC & CC_E) ? 'E' : '.',
-		(CC & CC_F) ? 'F' : '.',
-		(CC & CC_H) ? 'H' : '.',
-		(CC & CC_I) ? 'I' : '.',
-		(CC & CC_N) ? 'N' : '.',
-		(CC & CC_Z) ? 'Z' : '.',
-		(CC & CC_V) ? 'V' : '.',
-		(CC & CC_C) ? 'C' : '.',
-		DP);
-	mvprintw(start_y + 19, start_x - 1, "[F10]:Exit [F1]:Reset [F2]:Turbo [ESC/F3]:Break");
-	attroff(COLOR_PAIR(3));
-
-	refresh();
 }
 
 static inline void step_cpu(bool quiet)
@@ -1267,6 +1264,7 @@ if (!quiet)
 				uint8_t op2 = ram[PC++];
 				switch (op2)
 				{
+					// Long branches ($10 $21 to $10 $2F)
 					case 0x3F: // SWI2: stack everything, vector $FFF4 (I and F unchanged)
 						CC |= CC_E;
 						push_s16(PC); push_s16(U); push_s16(Y); push_s16(X);
@@ -1275,7 +1273,6 @@ if (!quiet)
 						if (!quiet) printf("\tSWI2 [103F]");
 						executed = true;
 						break;
-					// Long branches ($10 $21 to $10 $2F)
 					case 0x21: do_lbranch(false, "LBRN", quiet); executed = true; break;
 					case 0x22: do_lbranch(!(CC & (CC_C | CC_Z)), "LBHI", quiet); executed = true; break;
 					case 0x23: do_lbranch((CC & (CC_C | CC_Z)) != 0, "LBLS", quiet); executed = true; break;
@@ -1638,6 +1635,7 @@ if (!quiet)
 			case 0x13: // SYNC
 			{
 				PC++;
+				cpu_sync = true;
 				if (!quiet) printf("\tSYNC [13]");
 				executed = true;
 				break;
@@ -1876,6 +1874,7 @@ if (!quiet)
 				push_s8(B);
 				push_s8(A);
 				push_s8(CC);
+				cpu_cwai = true;
 				if (!quiet) printf("\tCWAI [3C]");
 				executed = true;
 				break;
@@ -2438,196 +2437,453 @@ if (!quiet)
 		}
 }
 
-int main(int argc, char **argv)
-{	
+// ---- Cycle timing -----------------------------------------------------------
+// Cycles per instruction from the MC6809 datasheet.  0 = not a 6809
+// instruction (counted as 2).  Indexed modes add idx_extra(); PSH/PUL add
+// one per byte; long branches on page 2 add one when taken; RTI takes 15
+// when it pulls the whole register set.
+
+static const uint8_t cyc_page1[256] =
+{
+	6,0,0,6,6,0,6,6,6,6,6,0,6,6,3,6,	// 0x00 direct
+	0,0,2,4,0,0,5,9,0,2,3,0,3,2,8,6,	// 0x10
+	3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,	// 0x20 branches
+	4,4,4,4,5,5,5,5,0,5,3,6,20,11,0,19,	// 0x30
+	2,0,0,2,2,0,2,2,2,2,2,0,2,2,0,2,	// 0x40 A
+	2,0,0,2,2,0,2,2,2,2,2,0,2,2,0,2,	// 0x50 B
+	6,0,0,6,6,0,6,6,6,6,6,0,6,6,3,6,	// 0x60 indexed
+	7,0,0,7,7,0,7,7,7,7,7,0,7,7,4,7,	// 0x70 extended
+	2,2,2,4,2,2,2,0,2,2,2,2,4,7,3,0,	// 0x80 immediate
+	4,4,4,6,4,4,4,4,4,4,4,4,6,7,5,5,	// 0x90 direct
+	4,4,4,6,4,4,4,4,4,4,4,4,6,7,5,5,	// 0xA0 indexed
+	5,5,5,7,5,5,5,5,5,5,5,5,7,8,6,6,	// 0xB0 extended
+	2,2,2,4,2,2,2,0,2,2,2,2,3,0,3,0,	// 0xC0 immediate
+	4,4,4,6,4,4,4,4,4,4,4,4,5,5,5,5,	// 0xD0 direct
+	4,4,4,6,4,4,4,4,4,4,4,4,5,5,5,5,	// 0xE0 indexed
+	5,5,5,7,5,5,5,5,5,5,5,5,6,6,6,6,	// 0xF0 extended
+};
+
+static uint8_t cyc_page2[256], cyc_page3[256];
+
+static void init_cycle_tables(void)
+{
+	memset(cyc_page2, 0, sizeof(cyc_page2));
+	memset(cyc_page3, 0, sizeof(cyc_page3));
+	for (int op = 0x21; op <= 0x2F; op++)
+	{
+		cyc_page2[op] = 5;			// long branches (+1 taken)
+	}
+	cyc_page2[0x3F] = 20;				// SWI2
+	cyc_page2[0x83] = 5; cyc_page2[0x8C] = 5; cyc_page2[0x8E] = 4;	// CMPD CMPY LDY imm
+	cyc_page2[0x93] = 7; cyc_page2[0x9C] = 7; cyc_page2[0x9E] = 6; cyc_page2[0x9F] = 6;
+	cyc_page2[0xA3] = 7; cyc_page2[0xAC] = 7; cyc_page2[0xAE] = 6; cyc_page2[0xAF] = 6;
+	cyc_page2[0xB3] = 8; cyc_page2[0xBC] = 8; cyc_page2[0xBE] = 7; cyc_page2[0xBF] = 7;
+	cyc_page2[0xCE] = 4;				// LDS imm
+	cyc_page2[0xDE] = 6; cyc_page2[0xDF] = 6;
+	cyc_page2[0xEE] = 6; cyc_page2[0xEF] = 6;
+	cyc_page2[0xFE] = 7; cyc_page2[0xFF] = 7;
+
+	cyc_page3[0x3F] = 20;				// SWI3
+	cyc_page3[0x83] = 5; cyc_page3[0x8C] = 5;	// CMPU CMPS imm
+	cyc_page3[0x93] = 7; cyc_page3[0x9C] = 7;
+	cyc_page3[0xA3] = 7; cyc_page3[0xAC] = 7;
+	cyc_page3[0xB3] = 8; cyc_page3[0xBC] = 8;
+}
+
+// Extra cycles for an indexed postbyte (datasheet table "Indexed addressing")
+static int idx_extra(uint8_t pb)
+{
+	static const uint8_t extra[16] = { 2, 3, 2, 3, 0, 1, 1, 0, 1, 4, 0, 4, 1, 5, 0, 5 };
+	if (!(pb & 0x80))
+	{
+		return 1;			// 5-bit offset
+	}
+	if (pb & 0x10)				// indirect
+	{
+		return (pb & 0x0F) == 0x0F ? 5 : extra[pb & 0x0F] + 3;
+	}
+	return extra[pb & 0x0F];
+}
+
+static int push_bytes(uint8_t mask)
+{
+	static const uint8_t size[8] = { 1, 1, 1, 1, 2, 2, 2, 2 };	// CC A B DP X Y U/S PC
+	int n = 0;
+	for (int b = 0; b < 8; b++)
+	{
+		if (mask & (1 << b))
+		{
+			n += size[b];
+		}
+	}
+	return n;
+}
+
+static void push_entire_state(void)
+{
+	push_s16(PC); push_s16(U); push_s16(Y); push_s16(X);
+	push_s8(DP); push_s8(B); push_s8(A); push_s8(CC);
+}
+
+// One step: take a pending interrupt, wait (SYNC/CWAI), or run one
+// instruction.  Returns the CPU cycles used.
+static int cpu_step(void)
+{
+	bool irq = pia_irq(&pia0);	// PIA0 -> IRQ
+	bool firq = pia_irq(&pia1);	// PIA1 -> FIRQ
+
+	if (cpu_sync)
+	{
+		if (!irq && !firq)
+		{
+			return 4;		// waiting for an interrupt line
+		}
+		cpu_sync = false;		// any line ends SYNC, even if masked
+	}
+
+	if (firq && !(CC & CC_F))
+	{
+		if (!cpu_cwai)
+		{
+			CC &= (uint8_t)~CC_E;
+			push_s16(PC);
+			push_s8(CC);
+		}
+		cpu_cwai = false;
+		CC |= CC_I | CC_F;
+		PC = mem_read16(0xFFF6);
+		return 10;
+	}
+	if (irq && !(CC & CC_I))
+	{
+		if (!cpu_cwai)
+		{
+			CC |= CC_E;
+			push_entire_state();
+		}
+		cpu_cwai = false;
+		CC |= CC_I;
+		PC = mem_read16(0xFFF8);
+		return 19;
+	}
+	if (cpu_cwai)
+	{
+		return 4;			// stacked, waiting for an unmasked interrupt
+	}
+
+	uint16_t pc0 = PC;
+	uint8_t op = ram[pc0];
+	int cycles;
+	bool long_branch = false;
+	if (op == 0x10 || op == 0x11)
+	{
+		uint8_t op2 = ram[(uint16_t)(pc0 + 1)];
+		cycles = (op == 0x10 ? cyc_page2 : cyc_page3)[op2];
+		if (cycles == 0)
+		{
+			cycles = 2;
+		}
+		uint8_t mode = op2 & 0xF0;
+		if (mode == 0xA0 || (op == 0x10 && mode == 0xE0))
+		{
+			cycles += idx_extra(ram[(uint16_t)(pc0 + 2)]);
+		}
+		long_branch = op == 0x10 && op2 >= 0x22 && op2 <= 0x2F;
+	}
+	else
+	{
+		cycles = cyc_page1[op] ? cyc_page1[op] : 2;
+		uint8_t mode = op & 0xF0;
+		if ((op >= 0x30 && op <= 0x33) || mode == 0x60 || mode == 0xA0 || mode == 0xE0)
+		{
+			cycles += idx_extra(ram[(uint16_t)(pc0 + 1)]);
+		}
+		else if (op >= 0x34 && op <= 0x37)
+		{
+			cycles += push_bytes(ram[(uint16_t)(pc0 + 1)]);
+		}
+	}
+
+	step_cpu(!trace_on);
+
+	if (long_branch && PC != (uint16_t)(pc0 + 4))
+	{
+		cycles += 1;
+	}
+	if (op == 0x3B && (CC & CC_E))
+	{
+		cycles += 9;			// RTI pulled the whole register set
+	}
+	return cycles;
+}
+
+// ---- Sound ------------------------------------------------------------------
+// The Dragon's audio is a mux (PIA0 CA2/CB2 pick DAC, tape, cartridge or
+// none; PIA1 CB2 switches it on) plus single-bit sound on PIA1 PB1.  Gains
+// and offsets are the voltages XRoar's author measured on a real Dragon
+// (max 4.70 V), indexed by single-bit sound: off, on+low, on+high.
+
+static const float mux_gain[4][3] =
+{
+	{ 4.50f / 4.70f, 2.84f / 4.70f, 3.40f / 4.70f },	// DAC
+	{ 0.50f / 4.70f, 0.40f / 4.70f, 0.50f / 4.70f },	// tape
+	{ 4.70f / 4.70f, 2.84f / 4.70f, 3.40f / 4.70f },	// cartridge
+	{ 0, 0, 0 },						// none
+};
+static const float mux_offset[4][3] =
+{
+	{ 0.20f / 4.70f, 0.18f / 4.70f, 1.30f / 4.70f },
+	{ 2.05f / 4.70f, 1.60f / 4.70f, 2.35f / 4.70f },
+	{ 0.00f / 4.70f, 0.18f / 4.70f, 1.30f / 4.70f },
+	{ 0, 0, 0 },
+};
+static const float sbs_offset[3] = { 0, 0, 3.90f / 4.70f };
+
+#define AUDIO_BUF	4096
+
+static float audio_level;		// bus level now, 0..1
+static unsigned audio_rate;		// samples per second, 0 = off
+static unsigned audio_per_frame;	// samples per 50 Hz frame
+static unsigned audio_phase;		// position in the current sample (cycles x samples)
+static float audio_sum;			// level x time in the current sample
+static float hp_in, hp_out;		// high-pass (the TV's coupling capacitor)
+static int16_t audio_buf[AUDIO_BUF];
+static unsigned audio_count;
+
+static void audio_update_level(void)
+{
+	bool sbs_on = (pia1.ddrb & 0x02) != 0;			// PB1 is an output
+	bool sbs_high = (pia1.orb & 0x02) != 0;
+	unsigned sindex = sbs_on ? (sbs_high ? 2 : 1) : 0;
+
+	if (pia_cx2(pia1.crb))					// PIA1 CB2: sound mux on
+	{
+		unsigned source = (pia_cx2(pia0.crb) ? 2 : 0) | (pia_cx2(pia0.cra) ? 1 : 0);
+		float raw = source == 0 ? (float)(pia_out_a(&pia1) & 0xFC) / 252.0f
+			  : source == 1 ? (tape_input_level() ? 1.0f : 0.0f) : 0.0f;	// 1 = tape (AUDIO ON)
+		audio_level = raw * mux_gain[source][sindex] + mux_offset[source][sindex];
+	}
+	else if (sbs_on)
+	{
+		audio_level = sbs_offset[sindex];		// single-bit sound only
+	}
+	// else: nothing drives the audio line; it holds its level
+}
+
+// The level held for this many cycles: add it to the samples it covers
+static void audio_run(int cycles, float level)
+{
+	if (audio_rate == 0)
+	{
+		return;
+	}
+	unsigned units = (unsigned)cycles * audio_per_frame;	// in (cycles x samples per frame)
+	while (audio_phase + units >= DRAGON_FRAME_CYCLES)
+	{
+		unsigned take = DRAGON_FRAME_CYCLES - audio_phase;
+		audio_sum += level * (float)take;
+		float x = audio_sum / (float)DRAGON_FRAME_CYCLES;
+		hp_out = 0.995f * (hp_out + x - hp_in);		// ~40 Hz high-pass at 48 kHz
+		hp_in = x;
+		float y = hp_out * 30000.0f;
+		if (y > 32767.0f) y = 32767.0f;
+		if (y < -32768.0f) y = -32768.0f;
+		if (audio_count < AUDIO_BUF)
+		{
+			audio_buf[audio_count++] = (int16_t)y;
+		}
+		audio_sum = 0;
+		audio_phase = 0;
+		units -= take;
+	}
+	audio_phase += units;
+	audio_sum += level * (float)units;
+}
+
+// ---- Platform API (dragon.h) ---------------------------------------------
+
+static unsigned frame_cycle;		// cycles into this 50 Hz frame
+static unsigned frame_line;		// video line the frame is on (0-311)
+static uint64_t total_cycles;
+static unsigned irq_count;		// IRQs taken (tests)
+
+void dragon_init(const uint8_t *rom_image)
+{
 	importOpcodes();
-
-	int cycleLimit = 150;
-	bool quiet = false;
-	bool interactive = false;
-	char *inject_string = NULL;
-   
-	filename = "d32.rom";	
-	for (int i = 1; i < argc; i++)
-	{
-		if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0)
-		{
-			quiet = true;
-		}
-		else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--interactive") == 0)
-		{
-			interactive = true;
-		}
-		else if (strcmp(argv[i], "--inject") == 0 && i + 1 < argc)
-		{
-			inject_string = argv[++i];
-		}
-		else if (isdigit((unsigned char)argv[i][0]))
-		{
-			cycleLimit = atoi(argv[i]);
-		}
-		else
-		{
-			filename = argv[i];
-		}
-	}
-
-	// Auto-detect interactive mode when running in a terminal without cycle limit or quiet flag
-	if (argc == 1 && isatty(STDIN_FILENO))
-	{
-		interactive = true;
-	}
-
-	loadRomFile();
-	printf("Copying ROM to RAM\n");
+	init_cycle_tables();
+	memcpy(rom, rom_image, sizeof(rom));
+	memset(ram, 0, sizeof(ram));
 	loadRom();
+	A = B = DP = 0;
+	X = Y = U = S = 0;
+	CC = CC_I | CC_F;	// interrupts masked after reset
+	pia_reset(&pia0);
+	pia_reset(&pia1);
+	cpu_sync = cpu_cwai = false;
+	kbd_clear_matrix();
+	kbd_q_head = kbd_q_tail = 0;
+	kbd_hold_cycles = kbd_release_cycles = 0;
+	frame_cycle = 0;
+	frame_line = 0;
+	total_cycles = 0;
+	audio_level = 0;
+	audio_count = 0;
+	tape_reset();
+	dragon_reset();
+}
 
+void dragon_reset(void)
+{
+	// The reset button resets the CPU and the PIAs (RAM is kept)
+	pia_reset(&pia0);
+	pia_reset(&pia1);
+	sam_reg = 0;
+	tape_set_motor(false);
+	cpu_sync = cpu_cwai = false;
+	CC = CC_I | CC_F;
+	DP = 0;
 	// 6809 Reset Vector at $FFFE-$FFFF
 	PC = ((uint16_t)ram[0xFFFE] << 8) | ram[0xFFFF];
+}
 
-	if (interactive)
+// The VDG's sync pulses: HS on PIA0 CA1 every line (57 cycles), FS on
+// PIA0 CB1 once a frame (312 lines, PAL).  FS falls as the picture ends
+// and rises again 32 lines later; BASIC's 50 Hz IRQ is on that rise.
+#define FS_FALL_LINE	0
+#define FS_RISE_LINE	32
+
+
+// One CPU step with everything that hangs off it: sound, tape, keyboard,
+// and the VDG's line (HS) and frame (FS) sync pulses as time passes.
+// Returns true when a 50 Hz frame has ended.
+static bool one_step(void)
+{
+	if (frame_cycle == 0 && frame_line == 0)
 	{
-		signal(SIGINT, cleanup_and_exit);
-		signal(SIGTERM, cleanup_and_exit);
-
-		initscr();
-		raw(); // raw, not cbreak: lets Ctrl+Q (XON) and Ctrl+C reach getch()
-		noecho();
-		nodelay(stdscr, TRUE);
-		keypad(stdscr, TRUE);
-		set_escdelay(25); // ESC (BREAK) responds at once instead of after 1 s
-		curs_set(0);
-		ncurses_active = true;
-
-		if (has_colors())
-		{
-			start_color();
-			init_pair(1, COLOR_BLACK, COLOR_GREEN); // Normal green screen
-			init_pair(2, COLOR_GREEN, COLOR_BLACK); // Inverted text
-			init_pair(3, COLOR_WHITE, COLOR_BLACK); // Chrome / Bezel
-		}
-
-		bool running = true;
-		bool turbo = false;
-		const int FRAME_CYCLES = 17800; // ~50 frames per second at 0.89 MHz
-
-		while (running)
-		{
-			struct timespec t_start, t_end;
-			clock_gettime(CLOCK_MONOTONIC, &t_start);
-
-			for (int i = 0; i < FRAME_CYCLES; i++)
-			{
-				kbd_update_cycles(1);
-				step_cpu(true);
-			}
-
-			draw_ncurses_screen();
-
-			int ch = getch();
-			while (ch != ERR)
-			{
-				if (ch == KEY_F(10) || ch == 17 || ch == 3) // F10, Ctrl+Q or Ctrl+C: exit
-				{
-					running = false;
-					break;
-				}
-				else if (ch == KEY_F(1)) // F1: CPU Reset
-				{
-					PC = ((uint16_t)ram[0xFFFE] << 8) | ram[0xFFFF];
-				}
-				else if (ch == KEY_F(2)) // F2: Toggle Turbo mode
-				{
-					turbo = !turbo;
-				}
-				else if (ch == 27 || ch == KEY_F(3)) // ESC or F3: Dragon 32 BREAK key
-				{
-					kbd_enqueue_special(6, 2, false); // Row 6, Col 2: BREAK
-				}
-				else if (ch == KEY_HOME || ch == KEY_CLEAR || ch == 12) // Home or Ctrl+L: Dragon 32 CLEAR key
-				{
-					kbd_enqueue_special(6, 1, false); // Row 6, Col 1: CLEAR
-				}
-				else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8)
-				{
-					kbd_enqueue_special(5, 5, false); // Row 5, Col 5: Left/Backspace
-				}
-				else if (ch == KEY_UP)
-				{
-					kbd_enqueue_special(5, 3, false); // Row 5, Col 3: Up
-				}
-				else if (ch == KEY_DOWN)
-				{
-					kbd_enqueue_special(5, 4, false); // Row 5, Col 4: Down
-				}
-				else if (ch == KEY_LEFT)
-				{
-					kbd_enqueue_special(5, 5, false); // Row 5, Col 5: Left
-				}
-				else if (ch == KEY_RIGHT)
-				{
-					kbd_enqueue_special(5, 6, false); // Row 5, Col 6: Right
-				}
-				else if (ch == '\n' || ch == '\r')
-				{
-					kbd_enqueue_char('\r');
-				}
-				else if (ch >= 32 && ch <= 126)
-				{
-					kbd_enqueue_char((char)ch);
-				}
-				ch = getch();
-			}
-
-			if (!turbo)
-			{
-				clock_gettime(CLOCK_MONOTONIC, &t_end);
-				long elapsed_us = (t_end.tv_sec - t_start.tv_sec) * 1000000L + (t_end.tv_nsec - t_start.tv_nsec) / 1000L;
-				if (elapsed_us < 20000L)
-				{
-					usleep((useconds_t)(20000L - elapsed_us));
-				}
-			}
-		}
-
-		endwin();
-		ncurses_active = false;
-		printf("Dragon 32 emulator exited cleanly.\n");
-		return 0;
+		pia_set_cx1(&pia0.crb, &pia0.cb1, false);	// FS falls: a frame begins
 	}
-
-	// Non-interactive (batch / trace) mode
-	printf("Cycle Limit (%i)\n", cycleLimit);
-	printf("Now running ROM code starting at %04X\n", PC);
-	if (!quiet)
+	bool in_irq = (CC & CC_I) == 0 && pia_irq(&pia0);
+	float level = audio_level;
+	int cycles = cpu_step();
+	if (in_irq && (CC & CC_I))
 	{
-		printf("PC\t\tINSTRUCTION\tOPERANDS\n");
+		irq_count++;
 	}
-
-	for (int c = 0; c < cycleLimit; c++)
+	audio_run(cycles, level);
+	tape_run(cycles, (pia_out_a(&pia1) >> 2) & 63);
+	if (dragon_tape_motor())
 	{
-		kbd_update_cycles(1);
-		if (c == 280000 && inject_string != NULL)
-		{
-			kbd_enqueue_string(inject_string);
-		}
-		step_cpu(quiet);
+		audio_update_level();	// the tape can be heard through the mux
 	}
+	kbd_update_cycles(cycles);
+	frame_cycle += (unsigned)cycles;
+	total_cycles += (unsigned)cycles;
 
-	printf("\nExecution completed (%d cycles):\n", cycleLimit);
-	printf("Final PC: %04X, Next Opcode: %02X\n", PC, ram[PC]);
-	printf("A: %02X, B: %02X, D: %04X, X: %04X, Y: %04X, U: %04X, S: %04X, DP: %02X\n",
-		A, B, get_D(), X, Y, U, S, DP);
-	printf("CC: %02X [%c%c%c%c%c%c%c%c]\n", CC,
-		(CC & CC_E) ? 'E' : '.',
-		(CC & CC_F) ? 'F' : '.',
-		(CC & CC_H) ? 'H' : '.',
-		(CC & CC_I) ? 'I' : '.',
-		(CC & CC_N) ? 'N' : '.',
-		(CC & CC_Z) ? 'Z' : '.',
-		(CC & CC_V) ? 'V' : '.',
-		(CC & CC_C) ? 'C' : '.');
+	while (frame_cycle >= (frame_line + 1) * DRAGON_LINE_CYCLES && frame_line < DRAGON_FRAME_LINES)
+	{
+		frame_line++;
+		pia_set_cx1(&pia0.cra, &pia0.ca1, false);	// HS pulse
+		pia_set_cx1(&pia0.cra, &pia0.ca1, true);
+		if (frame_line == FS_RISE_LINE)
+		{
+			pia_set_cx1(&pia0.crb, &pia0.cb1, true);	// FS rises: 50 Hz IRQ
+		}
+	}
+	if (frame_cycle >= DRAGON_FRAME_CYCLES)
+	{
+		frame_cycle -= DRAGON_FRAME_CYCLES;	// carry the overshoot into the next frame
+		frame_line = 0;
+		pia_set_cx1(&pia0.crb, &pia0.cb1, false);	// FS falls
+		return true;
+	}
+	return false;
+}
 
-	dump_screen();
-	return 0;
+void dragon_run_frame(void)
+{
+	while (!one_step())
+	{
+	}
+}
+
+void dragon_step(bool trace)
+{
+	trace_on = trace;
+	one_step();
+	trace_on = false;
+}
+
+unsigned dragon_sam(void)
+{
+	return sam_reg;
+}
+
+uint64_t dragon_cycles(void)
+{
+	return total_cycles;
+}
+
+unsigned dragon_irqs(void)
+{
+	return irq_count;
+}
+
+void dragon_audio_rate(unsigned rate)
+{
+	audio_rate = rate;
+	audio_per_frame = rate / 50;
+	audio_phase = 0;
+	audio_sum = 0;
+	audio_count = 0;
+}
+
+unsigned dragon_audio_take(int16_t *buf, unsigned max)
+{
+	unsigned n = audio_count < max ? audio_count : max;
+	memcpy(buf, audio_buf, n * sizeof(int16_t));
+	memmove(audio_buf, audio_buf + n, (audio_count - n) * sizeof(int16_t));
+	audio_count -= n;
+	return n;
+}
+
+const uint8_t *dragon_memory(void)
+{
+	return ram;
+}
+
+void dragon_regs(DragonRegs *regs)
+{
+	regs->pc = PC; regs->x = X; regs->y = Y; regs->u = U; regs->s = S;
+	regs->a = A; regs->b = B; regs->dp = DP; regs->cc = CC;
+	regs->wait = cpu_sync ? 1 : (cpu_cwai ? 2 : 0);
+}
+
+void dragon_set_matrix(const uint8_t matrix[8])
+{
+	// Typed keys own the matrix until they are all done
+	if (dragon_typing())
+	{
+		return;
+	}
+	memcpy(key_matrix, matrix, sizeof(key_matrix));
+}
+
+void dragon_type(const char *text)
+{
+	kbd_enqueue_string(text);
+}
+
+void dragon_type_key(int row, int col, bool shift)
+{
+	kbd_enqueue_special(row, col, shift);
+}
+
+bool dragon_typing(void)
+{
+	return kbd_q_head != kbd_q_tail || kbd_hold_cycles > 0 || kbd_release_cycles > 0;
+}
+
+bool dragon_char_key(char c, int *row, int *col, bool *shift)
+{
+	return kbd_map_char(c, row, col, shift);
 }
