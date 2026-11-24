@@ -34,16 +34,16 @@
 const uint8_t vdg_palette[VDG_COLOURS][3] =
 {
 	{  48, 210,   0 },	// green
-	{ 255, 255,  64 },	// yellow
-	{  32,  32, 255 },	// blue
-	{ 224,  24,  24 },	// red
-	{ 236, 236, 236 },	// buff
-	{  24, 216, 216 },	// cyan
-	{ 224,  24, 224 },	// magenta
-	{ 255, 132,   0 },	// orange
-	{   0,   0,   0 },	// black
-	{   0,  60,   0 },	// dark green (text on green)
-	{  80,  32,   0 },	// dark orange (text on orange)
+	{ 193, 229,   0 },	// yellow
+	{  76,  58, 180 },	// blue
+	{ 154,  50,  54 },	// red
+	{ 191, 200, 173 },	// buff
+	{  65, 175, 113 },	// cyan
+	{ 200,  78, 240 },	// magenta
+	{ 212, 127,   0 },	// orange
+	{  38,  48,  22 },	// black
+	{   0, 124,   0 },	// dark green (text on green)
+	{ 107,  39,   0 },	// dark orange (text on orange)
 };
 
 // 64 characters, 7 rows each, 5 dots per row ('#' = dot)
@@ -193,9 +193,9 @@ static void render_graphics_line(const uint8_t *row, unsigned mode, bool css, ui
 {
 	unsigned bytes = gmode[mode].bytes, bpp = gmode[mode].bpp, dot_w = gmode[mode].dot_w;
 	// 4 colours: green yellow blue red, or (CSS) buff cyan magenta orange.
-	// 2 colours: green on dark green, or (CSS) buff on black.
+	// 2 colours (resolution modes): the colour-set's first colour on black.
 	uint8_t first = css ? VDG_BUFF : VDG_GREEN;
-	uint8_t off = css ? VDG_BLACK : VDG_DARK_GREEN;
+	uint8_t off = VDG_BLACK;
 	unsigned x = 0;
 	for (unsigned i = 0; i < bytes; i++)
 	{

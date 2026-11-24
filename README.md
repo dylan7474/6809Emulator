@@ -76,7 +76,14 @@ Linux or macOS, with a C compiler and ncurses:
 make
 ```
 
-This builds `./emulator`.
+This builds `./emulator`.  To get the SDL window front end too:
+
+```sh
+# Debian/Ubuntu: sudo apt install libsdl2-dev
+make
+```
+
+SDL2 is picked up automatically (disable with `make HAS_SDL=0`).
 
 ## Run
 
@@ -86,6 +93,16 @@ This builds `./emulator`.
 ./emulator            # starts interactive when run in a terminal
 ./emulator -i other.rom
 ```
+
+**SDL window** (256 x 192 picture scaled up, with sound):
+
+```sh
+./emulator --sdl
+./emulator --sdl -i other.rom
+```
+
+Same keys as the terminal version (F1 reset, F2 turbo, F4 rewind the tape,
+F10 quit, Esc/F3 BREAK, Home CLEAR, arrows = cursor keys).
 
 | Key | Does |
 | --- | --- |
@@ -110,6 +127,7 @@ This builds `./emulator`.
 
 | Option | Meaning |
 | --- | --- |
+| `--sdl` | the SDL window front end (graphics, sound) instead of the terminal |
 | `N` (a number) | how many instructions to run (default 150) |
 | `-q`, `--quiet` | no per-instruction trace |
 | `-i`, `--interactive` | force the full-screen mode |
@@ -138,7 +156,9 @@ compare.
 ## Layout
 
 ```
-src/main.c          the terminal: ncurses screen and keys, batch / trace mode, tape files
+src/main.c          the terminal: ncurses screen and keys, batch / trace mode
+src/sdl.c           the SDL window: scaled picture, sound, keyboard matrix
+src/tapefile.c      cassette tape files as FILE* (shared by both front ends)
 src/core/           the shared Dragon core (from 6809Emulator-Metal):
   dragon_cpu.c      6809 CPU, memory map, PIAs, SAM, keyboard matrix, timing, sound
   tape.c            cassette deck (CAS/WAV in, WAV+CAS recording)

@@ -15,6 +15,7 @@
  * and the cassette deck.  This file is only the terminal around it.
  */
 #include "core/dragon.h"
+#include "tapefile.h"
 #include <ctype.h>
 #include <ncurses.h>
 #include <signal.h>
@@ -23,6 +24,14 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef HAS_SDL
+#define HAS_SDL 0
+#endif
+
+#if HAS_SDL
+int sdl_main(int argc, char **argv);
+#endif
 
 static bool ncurses_active;
 
@@ -36,109 +45,6 @@ static void cleanup_and_exit(int sig)
 	}
 	exit(0);
 }
-
-// ---- Tape files ----------------------------------------------------------------
-
-static FILE *tape_in;
-static const char *tape_name;
-
-static unsigned tape_read(void *ctx, uint32_t off, uint8_t *buf, unsigned len)
-{
-	(void)ctx;
-	if (fseek(tape_in, off, SEEK_SET) != 0)
-	{
-		return 0;
-	}
-	return (unsigned)fread(buf, 1, len, tape_in);
-}
-
-static bool insert_tape(const char *path)
-{
-	tape_in = fopen(path, "rb");
-	if (!tape_in)
-	{
-		perror(path);
-		return false;
-	}
-	fseek(tape_in, 0, SEEK_END);
-	uint32_t size = (uint32_t)ftell(tape_in);
-	const char *dot = strrchr(path, '.');
-	int kind = (dot && (!strcmp(dot, ".wav") || !strcmp(dot, ".WAV"))) ? DRAGON_TAPE_WAV : DRAGON_TAPE_CAS;
-	if (!dragon_tape_insert(kind, size, tape_read, NULL))
-	{
-		fprintf(stderr, "%s: not a tape this can play\n", path);
-		return false;
-	}
-	tape_name = path;
-	return true;
-}
-
-static const char *rec_prefix;
-static FILE *rec_wav, *rec_cas;
-static char rec_last[300];
-
-static void wav_header(FILE *f, uint32_t data)
-{
-	uint8_t h[44];
-	uint32_t riff = data + 36, fmtlen = 16, rate = DRAGON_TAPE_WAV_RATE, byterate = DRAGON_TAPE_WAV_RATE;
-	uint16_t pcm = 1, ch = 1, align = 1, bits = 8;
-	memcpy(h, "RIFF", 4); memcpy(h + 4, &riff, 4);
-	memcpy(h + 8, "WAVEfmt ", 8); memcpy(h + 16, &fmtlen, 4);
-	memcpy(h + 20, &pcm, 2); memcpy(h + 22, &ch, 2); memcpy(h + 24, &rate, 4);
-	memcpy(h + 28, &byterate, 4); memcpy(h + 32, &align, 2); memcpy(h + 34, &bits, 2);
-	memcpy(h + 36, "data", 4); memcpy(h + 40, &data, 4);
-	fseek(f, 0, SEEK_SET);
-	fwrite(h, 1, 44, f);
-}
-
-static void rec_begin(void *ctx)
-{
-	(void)ctx;
-	char name[300];
-	snprintf(name, sizeof(name), "%s.wav", rec_prefix);
-	rec_wav = fopen(name, "wb");
-	snprintf(name, sizeof(name), "%s.cas", rec_prefix);
-	rec_cas = fopen(name, "wb");
-	if (rec_wav)
-	{
-		wav_header(rec_wav, 0);
-	}
-}
-
-static void rec_wavdata(void *ctx, const uint8_t *s, unsigned n)
-{
-	(void)ctx;
-	if (rec_wav) fwrite(s, 1, n, rec_wav);
-}
-
-static void rec_casdata(void *ctx, const uint8_t *b, unsigned n)
-{
-	(void)ctx;
-	if (rec_cas) fwrite(b, 1, n, rec_cas);
-}
-
-static void rec_end(void *ctx, const char *name)
-{
-	(void)ctx;
-	if (rec_wav)
-	{
-		wav_header(rec_wav, (uint32_t)(ftell(rec_wav) - 44));
-		fclose(rec_wav);
-		rec_wav = NULL;
-	}
-	if (rec_cas)
-	{
-		fclose(rec_cas);
-		rec_cas = NULL;
-	}
-	snprintf(rec_last, sizeof(rec_last), "saved \"%s\" to %s.wav + .cas", name, rec_prefix);
-	if (!ncurses_active)
-	{
-		printf("Tape: %s\n", rec_last);
-	}
-}
-
-static const DragonTapeRecorder recorder = { NULL, rec_begin, rec_wavdata, rec_casdata, rec_end };
 
 // ---- Screen --------------------------------------------------------------------
 
@@ -170,6 +76,17 @@ static void print_regs(void)
 	       (r.cc & 0x80) ? 'E' : '.', (r.cc & 0x40) ? 'F' : '.', (r.cc & 0x20) ? 'H' : '.',
 	       (r.cc & 0x10) ? 'I' : '.', (r.cc & 0x08) ? 'N' : '.', (r.cc & 0x04) ? 'Z' : '.',
 	       (r.cc & 0x02) ? 'V' : '.', (r.cc & 0x01) ? 'C' : '.');
+}
+
+// The eight 6847 semigraphics colours, as the nearest ncurses colour
+// (orange has no exact ncurses colour, so it shares red's slot).
+static int sg_colour(unsigned i)
+{
+	static const int map[8] = {
+		COLOR_GREEN, COLOR_YELLOW, COLOR_BLUE, COLOR_RED,
+		COLOR_WHITE, COLOR_CYAN, COLOR_MAGENTA, COLOR_RED
+	};
+	return map[i & 7];
 }
 
 static void draw_screen(bool turbo)
@@ -204,18 +121,23 @@ static void draw_screen(bool turbo)
 			{
 				uint8_t ch = mem[(base + r * 32 + c) & 0xFFFF];
 				char out;
-				bool inverted = false;
+				int pair;
 				if (ch & 0x80)
 				{
-					out = '#';			// semigraphics block
+					// Semigraphics-4: bits 6-4 are the colour, bits 3-0
+					// which quarters of the cell are lit.  A solid cell
+					// (all four quarters) is drawn as a colour block;
+					// anything else as '#' in that colour.
+					unsigned colour = (ch >> 4) & 7;
+					out = (ch & 0x0F) == 0x0F ? ' ' : '#';
+					pair = (ch & 0x0F) == 0x0F ? 12 + colour : 4 + colour;
 				}
 				else
 				{
 					unsigned code = ch & 0x3F;	// 6847 order: @A-Z[\]^_ then space..?
 					out = (char)(code < 32 ? code + 64 : code);
-					inverted = (ch & 0x40) == 0;
+					pair = (ch & 0x40) ? 1 : 2;	// bit 6 = 0 -> inverse
 				}
-				int pair = inverted ? 2 : 1;
 				attron(COLOR_PAIR(pair));
 				mvaddch(top + r, left + c, out);
 				attroff(COLOR_PAIR(pair));
@@ -230,7 +152,7 @@ static void draw_screen(bool turbo)
 		 reg.pc, reg.a, reg.b, reg.x, reg.y, reg.s, (mem[0x112] << 8) | mem[0x113]);
 	if (dragon_tape_inserted())
 	{
-		mvprintw(top + 18, left - 1, "TAPE: %.30s %u.%u/%u.%us %s motor %s     ", tape_name,
+		mvprintw(top + 18, left - 1, "TAPE: %.30s %u.%u/%u.%us %s motor %s     ", tapefile_name(),
 			 dragon_tape_pos_ms() / 1000, dragon_tape_pos_ms() % 1000 / 100,
 			 dragon_tape_len_ms() / 1000, dragon_tape_len_ms() % 1000 / 100,
 			 dragon_tape_playing() ? "PLAY" : "STOP", dragon_tape_motor() ? "ON " : "OFF");
@@ -239,9 +161,9 @@ static void draw_screen(bool turbo)
 	{
 		mvprintw(top + 18, left - 1, "TAPE: none (--tape FILE.cas/.wav)%s", turbo ? "  TURBO" : "      ");
 	}
-	if (rec_last[0])
+	if (tapefile_last()[0])
 	{
-		mvprintw(top + 19, left - 1, "%-60.60s", rec_last);
+		mvprintw(top + 19, left - 1, "%-60.60s", tapefile_last());
 	}
 	mvprintw(top + 20, left - 1, "[F10]:Exit [F1]:Reset [F2]:Turbo [F4]:Rewind tape [ESC/F3]:Break");
 	attroff(COLOR_PAIR(3));
@@ -271,11 +193,14 @@ int main(int argc, char **argv)
 	const char *inject = NULL;
 	const char *rom_file = "d32.rom";
 	const char *tape_file = NULL;
+	const char *rec_prefix = NULL;
+	bool use_sdl = false;
 
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "-q") || !strcmp(argv[i], "--quiet")) quiet = true;
 		else if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--interactive")) interactive = true;
+		else if (!strcmp(argv[i], "--sdl")) use_sdl = true;
 		else if (!strcmp(argv[i], "--inject") && i + 1 < argc) inject = argv[++i];
 		else if (!strcmp(argv[i], "--tape") && i + 1 < argc) tape_file = argv[++i];
 		else if (!strcmp(argv[i], "--record") && i + 1 < argc) rec_prefix = argv[++i];
@@ -303,13 +228,23 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	dragon_init(rom);
-	if (tape_file && !insert_tape(tape_file))
+	if (tape_file && !tapefile_insert(tape_file))
 	{
 		return 1;
 	}
 	if (rec_prefix)
 	{
-		dragon_tape_recorder(&recorder);
+		tapefile_record(rec_prefix);
+	}
+
+	if (use_sdl)
+	{
+#if HAS_SDL
+		return sdl_main(argc, argv);
+#else
+		fprintf(stderr, "--sdl needs SDL2 (install libsdl2-dev and rebuild)\n");
+		return 1;
+#endif
 	}
 
 	if (interactive)
@@ -327,9 +262,40 @@ int main(int argc, char **argv)
 		if (has_colors())
 		{
 			start_color();
+			if (can_change_color())
+			{
+				// Redefine the base colours from the VDG's measured palette.
+				init_color(COLOR_BLACK, vdg_palette[VDG_BLACK][0] * 1000 / 255,
+					   vdg_palette[VDG_BLACK][1] * 1000 / 255,
+					   vdg_palette[VDG_BLACK][2] * 1000 / 255);
+				init_color(COLOR_RED, vdg_palette[VDG_RED][0] * 1000 / 255,
+					   vdg_palette[VDG_RED][1] * 1000 / 255,
+					   vdg_palette[VDG_RED][2] * 1000 / 255);
+				init_color(COLOR_GREEN, vdg_palette[VDG_GREEN][0] * 1000 / 255,
+					   vdg_palette[VDG_GREEN][1] * 1000 / 255,
+					   vdg_palette[VDG_GREEN][2] * 1000 / 255);
+				init_color(COLOR_YELLOW, vdg_palette[VDG_YELLOW][0] * 1000 / 255,
+					   vdg_palette[VDG_YELLOW][1] * 1000 / 255,
+					   vdg_palette[VDG_YELLOW][2] * 1000 / 255);
+				init_color(COLOR_BLUE, vdg_palette[VDG_BLUE][0] * 1000 / 255,
+					   vdg_palette[VDG_BLUE][1] * 1000 / 255,
+					   vdg_palette[VDG_BLUE][2] * 1000 / 255);
+				init_color(COLOR_MAGENTA, vdg_palette[VDG_MAGENTA][0] * 1000 / 255,
+					   vdg_palette[VDG_MAGENTA][1] * 1000 / 255,
+					   vdg_palette[VDG_MAGENTA][2] * 1000 / 255);
+				init_color(COLOR_CYAN, vdg_palette[VDG_CYAN][0] * 1000 / 255,
+					   vdg_palette[VDG_CYAN][1] * 1000 / 255,
+					   vdg_palette[VDG_CYAN][2] * 1000 / 255);
+			}
 			init_pair(1, COLOR_BLACK, COLOR_GREEN);	// normal green screen
 			init_pair(2, COLOR_GREEN, COLOR_BLACK);	// inverse text
 			init_pair(3, COLOR_WHITE, COLOR_BLACK);	// chrome
+			for (int i = 0; i < 8; i++)
+			{
+				// Semigraphics-4: colour i as a foreground or background
+				init_pair(4 + i, sg_colour(i), COLOR_BLACK);
+				init_pair(12 + i, COLOR_BLACK, sg_colour(i));
+			}
 		}
 
 		bool running = true, turbo = false;
@@ -368,7 +334,7 @@ int main(int argc, char **argv)
 				}
 			}
 		}
-		dragon_tape_record_finish();
+		tapefile_finish();
 		endwin();
 		ncurses_active = false;
 		printf("Dragon 32 emulator exited cleanly.\n");
@@ -391,7 +357,7 @@ int main(int argc, char **argv)
 		}
 		dragon_step(!quiet);
 	}
-	dragon_tape_record_finish();
+	tapefile_finish();
 
 	DragonRegs r;
 	dragon_regs(&r);
